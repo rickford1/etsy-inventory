@@ -14,6 +14,7 @@ from inventory import (
     deduct_materials_for_order, get_low_materials, get_low_stock,
     upsert_ledger_entry, aggregate_fees_into_orders,
     apply_shipping_average, apply_period_average_fees,
+    upsert_meta_spend,
 )
 
 
@@ -150,6 +151,38 @@ def sync_payments(client: EtsyClient):
     print(f"  {updated} receipts updated with processing fees")
 
 
+def sync_meta_spend(days_back: int = 90):
+    """Pull daily per-campaign insights from Meta and upsert into meta_spend."""
+    print(f"Syncing Meta ad spend (last {days_back} days)...")
+    try:
+        from meta_client import MetaClient
+    except ImportError:
+        print("  meta_client not available, skipping")
+        return
+
+    client = MetaClient()
+    rows = client.get_daily_insights(days_back=days_back, level="campaign")
+    if not rows:
+        print("  no spend rows returned (campaign may not have run)")
+        return
+
+    for r in rows:
+        upsert_meta_spend(
+            date=r["date_start"],
+            campaign_id=r.get("campaign_id", "account"),
+            campaign_name=r.get("campaign_name", ""),
+            spend=float(r.get("spend", 0)),
+            impressions=int(r.get("impressions", 0)),
+            clicks=int(r.get("clicks", 0)),
+            link_clicks=int(r.get("inline_link_clicks", 0)),
+            cpc=float(r.get("cpc", 0)),
+            ctr=float(r.get("ctr", 0)),
+            reach=int(r.get("reach", 0)),
+        )
+    total_spend = sum(float(r.get("spend", 0)) for r in rows)
+    print(f"  {len(rows)} daily rows synced  |  ${total_spend:.2f} total spend")
+
+
 def print_alerts():
     low_materials = get_low_materials()
     if low_materials:
@@ -171,6 +204,7 @@ def main():
     sync_orders(client)
     sync_ledger(client)
     sync_payments(client)
+    sync_meta_spend()
     print_alerts()
 
 

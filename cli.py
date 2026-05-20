@@ -18,6 +18,9 @@ Commands:
 
   settings                          Show all settings
   set-setting <key> <value>         Update a setting (e.g. filament_cost_per_roll 14.00)
+
+  marketing [days]                  Show Meta ad spend / clicks / CPC / CTR (default 30 days)
+  roas [days]                       Compare Meta spend vs Etsy revenue with raw + lift ROAS (default 90)
 """
 
 import sys
@@ -28,8 +31,9 @@ from inventory import (
     get_all_materials, get_material, set_material_stock, set_material_cost, add_material_stock,
     get_all_settings, get_setting, set_setting,
     get_orders, get_revenue_summary, get_orders_with_fees,
+    get_meta_spend_recent, get_roas_breakdown,
 )
-from sync import sync_listings, sync_orders, sync_ledger, sync_payments
+from sync import sync_listings, sync_orders, sync_ledger, sync_payments, sync_meta_spend
 
 
 def cmd_sync():
@@ -39,6 +43,7 @@ def cmd_sync():
     sync_orders(client)
     sync_ledger(client)
     sync_payments(client)
+    sync_meta_spend()
 
 
 def cmd_listings():
@@ -185,6 +190,58 @@ def cmd_set_setting(key: str, value: str):
     print(f"Set {key} = {value}")
 
 
+def cmd_marketing(days: int = 30):
+    init_db()
+    rows = get_meta_spend_recent(days)
+    if not rows:
+        print(f"No Meta spend in last {days} days. Run: python cli.py sync")
+        return
+    header = f"{'Date':<12} {'Campaign':<35} {'Spend':>7}  {'Clicks':>6}  {'CPC':>6}  {'CTR':>5}"
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        name = (r["campaign_name"] or "")[:33]
+        print(f"{r['date']:<12} {name:<35} ${r['spend']:>6.2f}  {r['link_clicks']:>6}  ${r['cpc']:>5.3f}  {r['ctr']:>4.1f}%")
+    total_spend = sum(r["spend"] for r in rows)
+    total_clicks = sum(r["link_clicks"] for r in rows)
+    print("-" * len(header))
+    print(f"{'TOTAL':<12} {'':<35} ${total_spend:>6.2f}  {total_clicks:>6}")
+
+
+def cmd_roas(days: int = 90):
+    init_db()
+    r = get_roas_breakdown(days)
+    if r["ad_days"] == 0:
+        print(f"No Meta spend in last {days} days. Run: python cli.py sync")
+        return
+
+    print(f"=== Daily side-by-side (last {days} days, ad days only) ===")
+    print(f"{'Date':<12} {'Meta $':>7}  {'Clicks':>6}  {'Etsy $':>8}  {'Orders':>6}  {'ROAS':>6}")
+    print("-" * 56)
+    for d in r["daily"]:
+        if d["spend"] <= 0:
+            continue
+        roas = (d["revenue"] / d["spend"]) if d["spend"] > 0 else 0
+        print(f"{d['date']:<12} ${d['spend']:>6.2f}  {d['link_clicks']:>6}  ${d['revenue']:>7.2f}  {d['orders']:>6}  {roas:>5.2f}x")
+    print()
+
+    print(f"=== Summary ===")
+    print(f"  Ad days:     {r['ad_days']}  |  Spent ${r['ad_spend']:.2f}  |  {r['ad_clicks']} link clicks  |  {r['ad_orders']} orders  |  ${r['ad_revenue']:.2f} revenue")
+    print(f"  Baseline:    {r['no_ad_days']} ad-off days  |  {r['no_ad_orders']} orders  |  ${r['no_ad_revenue']:.2f} revenue")
+    print()
+    print(f"  Raw ROAS (naive):    {r['raw_roas']:.2f}x   (revenue / spend on ad days)")
+    print(f"  Lift ROAS (honest):  {r['lift_roas']:.2f}x   (incremental revenue / spend)")
+    print()
+    print(f"  avg/day no-ads:   ${r['baseline_per_day']:.2f}")
+    print(f"  avg/day with-ads: ${r['ad_per_day']:.2f}")
+    print(f"  daily lift:       ${r['lift_per_day']:+.2f}")
+    print(f"  total lift:       ${r['lift_total']:+.2f}  (vs ${r['ad_spend']:.2f} spent)")
+    print()
+    if r['ad_days'] < 14:
+        print(f"  Note: only {r['ad_days']} ad days — too small for confident attribution. Run longer.")
+
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] == "help":
@@ -233,6 +290,12 @@ def main():
             print("Usage: python cli.py set-setting <key> <value>")
             sys.exit(1)
         cmd_set_setting(args[1], args[2])
+    elif cmd == "marketing":
+        days = int(args[1]) if len(args) > 1 else 30
+        cmd_marketing(days)
+    elif cmd == "roas":
+        days = int(args[1]) if len(args) > 1 else 90
+        cmd_roas(days)
     else:
         print(f"Unknown command: {cmd}")
         print(__doc__)

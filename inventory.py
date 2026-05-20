@@ -100,6 +100,22 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_ledger_type ON ledger_entries(ledger_type);
             CREATE INDEX IF NOT EXISTS idx_ledger_ref ON ledger_entries(reference_type, reference_id);
             CREATE INDEX IF NOT EXISTS idx_ledger_created ON ledger_entries(created_at);
+
+            CREATE TABLE IF NOT EXISTS meta_spend (
+                date          TEXT NOT NULL,
+                campaign_id   TEXT NOT NULL DEFAULT 'account',
+                campaign_name TEXT,
+                spend         REAL DEFAULT 0,
+                impressions   INTEGER DEFAULT 0,
+                clicks        INTEGER DEFAULT 0,
+                link_clicks   INTEGER DEFAULT 0,
+                cpc           REAL DEFAULT 0,
+                ctr           REAL DEFAULT 0,
+                reach         INTEGER DEFAULT 0,
+                PRIMARY KEY (date, campaign_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_meta_date ON meta_spend(date);
         """)
         _migrate_orders_columns(conn)
         _seed_defaults(conn)
@@ -553,6 +569,110 @@ def apply_shipping_average():
         avg = total_shipping / order_count
         conn.execute("UPDATE orders SET shipping_cost=? WHERE status != 'cancelled'", (avg,))
         return avg
+
+
+# --- Meta ad spend ---
+
+def upsert_meta_spend(date: str, campaign_id: str, campaign_name: str,
+                     spend: float, impressions: int, clicks: int,
+                     link_clicks: int, cpc: float, ctr: float, reach: int):
+    with _db() as conn:
+        conn.execute("""
+            INSERT INTO meta_spend
+                (date, campaign_id, campaign_name, spend, impressions, clicks, link_clicks, cpc, ctr, reach)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(date, campaign_id) DO UPDATE SET
+                campaign_name=excluded.campaign_name,
+                spend=excluded.spend, impressions=excluded.impressions,
+                clicks=excluded.clicks, link_clicks=excluded.link_clicks,
+                cpc=excluded.cpc, ctr=excluded.ctr, reach=excluded.reach
+        """, (date, campaign_id, campaign_name, spend, impressions, clicks, link_clicks, cpc, ctr, reach))
+
+
+def get_meta_spend_recent(days: int = 30) -> list[dict]:
+    with _db() as conn:
+        rows = conn.execute(f"""
+            SELECT date, campaign_name, spend, impressions, clicks, link_clicks, cpc, ctr
+            FROM meta_spend
+            WHERE date >= date('now', '-{int(days)} days')
+            ORDER BY date DESC, campaign_id
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_roas_breakdown(days: int = 90) -> dict:
+    """Compute side-by-side daily Meta spend and Etsy revenue. Returns both raw and lift ROAS."""
+    with _db() as conn:
+        meta_rows = conn.execute(f"""
+            SELECT date, SUM(spend) as spend, SUM(link_clicks) as link_clicks
+            FROM meta_spend
+            WHERE date >= date('now', '-{int(days)} days')
+            GROUP BY date
+            ORDER BY date
+        """).fetchall()
+
+        etsy_rows = conn.execute(f"""
+            SELECT substr(created_at, 1, 10) as date,
+                   COUNT(*) as orders,
+                   COALESCE(SUM(total_price), 0) as revenue
+            FROM orders
+            WHERE status != 'cancelled'
+              AND created_at >= datetime('now', '-{int(days)} days')
+            GROUP BY date
+            ORDER BY date
+        """).fetchall()
+
+    meta_by_date = {r["date"]: dict(r) for r in meta_rows}
+    etsy_by_date = {r["date"]: dict(r) for r in etsy_rows}
+
+    # Days where ads ran
+    ad_days = sorted(meta_by_date.keys())
+    no_ad_days = sorted(d for d in etsy_by_date if d not in meta_by_date)
+
+    ad_spend    = sum(meta_by_date[d]["spend"] for d in ad_days)
+    ad_revenue  = sum(etsy_by_date.get(d, {"revenue": 0})["revenue"] for d in ad_days)
+    ad_clicks   = sum(meta_by_date[d]["link_clicks"] for d in ad_days)
+    ad_orders   = sum(etsy_by_date.get(d, {"orders": 0})["orders"] for d in ad_days)
+
+    no_ad_revenue = sum(etsy_by_date[d]["revenue"] for d in no_ad_days)
+    no_ad_orders  = sum(etsy_by_date[d]["orders"] for d in no_ad_days)
+
+    raw_roas = (ad_revenue / ad_spend) if ad_spend > 0 else 0
+    baseline_per_day = (no_ad_revenue / len(no_ad_days)) if no_ad_days else 0
+    ad_per_day = (ad_revenue / len(ad_days)) if ad_days else 0
+    lift_per_day = ad_per_day - baseline_per_day
+    lift_total = lift_per_day * len(ad_days)
+    lift_roas = (lift_total / ad_spend) if ad_spend > 0 else 0
+
+    daily = []
+    for d in sorted(set(meta_by_date) | set(etsy_by_date)):
+        m = meta_by_date.get(d, {})
+        e = etsy_by_date.get(d, {})
+        daily.append({
+            "date": d,
+            "spend": m.get("spend", 0) or 0,
+            "link_clicks": m.get("link_clicks", 0) or 0,
+            "orders": e.get("orders", 0) or 0,
+            "revenue": e.get("revenue", 0) or 0,
+        })
+
+    return {
+        "daily": daily,
+        "ad_days": len(ad_days),
+        "no_ad_days": len(no_ad_days),
+        "ad_spend": ad_spend,
+        "ad_revenue": ad_revenue,
+        "ad_clicks": ad_clicks,
+        "ad_orders": ad_orders,
+        "no_ad_revenue": no_ad_revenue,
+        "no_ad_orders": no_ad_orders,
+        "raw_roas": raw_roas,
+        "baseline_per_day": baseline_per_day,
+        "ad_per_day": ad_per_day,
+        "lift_per_day": lift_per_day,
+        "lift_total": lift_total,
+        "lift_roas": lift_roas,
+    }
 
 
 def get_revenue_summary() -> dict:
