@@ -33,7 +33,7 @@ from inventory import (
     get_orders, get_revenue_summary, get_orders_with_fees,
     get_meta_spend_recent, get_roas_breakdown,
 )
-from sync import sync_listings, sync_orders, sync_ledger, sync_payments, sync_meta_spend
+from sync import sync_listings, sync_orders, sync_ledger, sync_payments, sync_meta_spend, stamp_last_sync
 
 
 def cmd_sync():
@@ -44,6 +44,7 @@ def cmd_sync():
     sync_ledger(client)
     sync_payments(client)
     sync_meta_spend()
+    stamp_last_sync()
 
 
 def cmd_listings():

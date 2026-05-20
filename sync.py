@@ -14,8 +14,12 @@ from inventory import (
     deduct_materials_for_order, get_low_materials, get_low_stock,
     upsert_ledger_entry, aggregate_fees_into_orders,
     apply_shipping_average, apply_period_average_fees,
-    upsert_meta_spend,
+    upsert_meta_spend, set_setting,
 )
+
+
+def stamp_last_sync():
+    set_setting("last_sync_at", datetime.now(timezone.utc).isoformat())
 
 
 def sync_listings(client: EtsyClient):
@@ -205,6 +209,7 @@ def main():
     sync_ledger(client)
     sync_payments(client)
     sync_meta_spend()
+    stamp_last_sync()
     print_alerts()
 
 
