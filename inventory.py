@@ -3,19 +3,23 @@ Local SQLite inventory database.
 Tracks listings, materials, stock levels, and order history.
 """
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 
 DB_PATH = "inventory.db"
 
-GRAMS_PER_ITEM = 84
-GRAMS_PER_ROLL = 1000
+# Which starter materials + bill-of-materials to seed on a fresh database.
+# "3d-printing" reproduces the original filament/packaging setup; "none" starts
+# empty so any shop can define its own materials and BOM.
+SEED_PRESET = os.getenv("SEED_PRESET", "3d-printing").strip().lower()
 
-# Per-order consumables (counts)
-BUNGEES_PER_ORDER = 2
-ENVELOPES_PER_ORDER = 1
-LABELS_PER_ORDER = 1
+GRAMS_PER_ROLL = 1000  # used to convert filament_cost_per_roll -> cost per gram
+
+# BOM sentinels
+DEFAULT_LISTING = 0                       # per-item BOM applied to any listing without its own
+ACTIVE_FILAMENT_REF = "@active_filament"  # resolves to the active_filament setting at deduct time
 
 
 @contextmanager
@@ -116,9 +120,18 @@ def init_db():
             );
 
             CREATE INDEX IF NOT EXISTS idx_meta_date ON meta_spend(date);
+
+            CREATE TABLE IF NOT EXISTS bom (
+                scope      TEXT NOT NULL,               -- 'item' (per item) or 'order' (per shipment)
+                listing_id INTEGER NOT NULL DEFAULT 0,  -- specific listing, or 0 = default / order scope
+                material   TEXT NOT NULL,
+                quantity   REAL NOT NULL,
+                PRIMARY KEY (scope, listing_id, material)
+            );
         """)
         _migrate_orders_columns(conn)
         _seed_defaults(conn)
+        _migrate_bom(conn)
 
 
 def _migrate_orders_columns(conn):
@@ -150,7 +163,12 @@ def _migrate_orders_columns(conn):
 
 
 def _seed_defaults(conn):
-    # Default settings
+    if SEED_PRESET == "3d-printing":
+        _seed_3d_printing(conn)
+
+
+def _seed_3d_printing(conn):
+    """Seed the original filament + packaging materials. Idempotent."""
     defaults = {
         "filament_cost_per_roll": "11.00",
         "active_filament": "filament_1",
@@ -161,7 +179,6 @@ def _seed_defaults(conn):
             (key, value)
         )
 
-    # Seed materials if not present
     materials = [
         ("filament_1", "grams", 1000, None, 200),
         ("filament_2", "grams", 1000, None, 200),
@@ -183,6 +200,26 @@ def _seed_defaults(conn):
             "UPDATE materials SET cost_per_unit=? WHERE name IN ('filament_1','filament_2')",
             (cost_per_gram,)
         )
+
+
+def _migrate_bom(conn):
+    """Seed the default bill-of-materials once, if empty. For the 3d-printing
+    preset this reproduces the original hardcoded rules: 84g of the active
+    filament per item, plus 2 bungees + 1 envelope + 1 label per order."""
+    if conn.execute("SELECT COUNT(*) FROM bom").fetchone()[0]:
+        return
+    if SEED_PRESET != "3d-printing":
+        return
+    rows = [
+        ("item",  DEFAULT_LISTING, ACTIVE_FILAMENT_REF, 84),
+        ("order", DEFAULT_LISTING, "bungee_cords", 2),
+        ("order", DEFAULT_LISTING, "envelopes", 1),
+        ("order", DEFAULT_LISTING, "labels", 1),
+    ]
+    conn.executemany(
+        "INSERT OR IGNORE INTO bom (scope, listing_id, material, quantity) VALUES (?, ?, ?, ?)",
+        rows,
+    )
 
 
 # --- Settings ---
@@ -251,42 +288,89 @@ def add_material_stock(name: str, amount: float):
         conn.execute("UPDATE materials SET stock=stock+? WHERE name=?", (amount, name))
 
 
-def deduct_materials_for_order(item_count: int) -> float:
-    """Deduct filament + consumables for one order. Returns COGS."""
-    filament_name = get_active_filament()
-    filament_grams = item_count * GRAMS_PER_ITEM
+def add_material(name: str, unit: str, cost_per_unit: float = 0.0,
+                 stock: float = 0.0, low_threshold: float = 0.0):
+    """Create a material (or update its unit if it already exists)."""
+    with _db() as conn:
+        conn.execute("""
+            INSERT INTO materials (name, unit, stock, cost_per_unit, low_threshold)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET unit=excluded.unit
+        """, (name, unit, stock, cost_per_unit, low_threshold))
+
+
+def _resolve_material(name: str, active_filament: str) -> str:
+    return active_filament if name == ACTIVE_FILAMENT_REF else name
+
+
+def deduct_materials_for_order(items: list[dict]) -> float:
+    """Deduct bill-of-materials for one order and return COGS.
+
+    items: [{'listing_id': int, 'quantity': int}, ...] — one entry per line item.
+    Per-item materials use the listing's own BOM, falling back to the default
+    (listing_id=0) BOM. 'order'-scope materials are consumed once per shipment.
+    """
+    active_filament = get_active_filament()
+    consumption: dict[str, float] = {}
 
     with _db() as conn:
-        conn.execute(
-            "UPDATE materials SET stock=MAX(0, stock-?) WHERE name=?",
-            (filament_grams, filament_name)
-        )
-        conn.execute(
-            "UPDATE materials SET stock=MAX(0, stock-?) WHERE name='bungee_cords'",
-            (BUNGEES_PER_ORDER,)
-        )
-        conn.execute(
-            "UPDATE materials SET stock=MAX(0, stock-?) WHERE name='envelopes'",
-            (ENVELOPES_PER_ORDER,)
-        )
-        conn.execute(
-            "UPDATE materials SET stock=MAX(0, stock-?) WHERE name='labels'",
-            (LABELS_PER_ORDER,)
-        )
+        for it in items:
+            lid = it.get("listing_id") or DEFAULT_LISTING
+            qty = it.get("quantity") or 0
+            rows = conn.execute(
+                "SELECT material, quantity FROM bom WHERE scope='item' AND listing_id=?", (lid,)
+            ).fetchall()
+            if not rows and lid != DEFAULT_LISTING:
+                rows = conn.execute(
+                    "SELECT material, quantity FROM bom WHERE scope='item' AND listing_id=?",
+                    (DEFAULT_LISTING,)
+                ).fetchall()
+            for r in rows:
+                mat = _resolve_material(r["material"], active_filament)
+                consumption[mat] = consumption.get(mat, 0) + r["quantity"] * qty
 
-        # Calculate COGS
-        filament = conn.execute("SELECT cost_per_unit FROM materials WHERE name=?", (filament_name,)).fetchone()
-        bungee   = conn.execute("SELECT cost_per_unit FROM materials WHERE name='bungee_cords'").fetchone()
-        envelope = conn.execute("SELECT cost_per_unit FROM materials WHERE name='envelopes'").fetchone()
-        label    = conn.execute("SELECT cost_per_unit FROM materials WHERE name='labels'").fetchone()
+        for r in conn.execute(
+            "SELECT material, quantity FROM bom WHERE scope='order' AND listing_id=?",
+            (DEFAULT_LISTING,)
+        ).fetchall():
+            mat = _resolve_material(r["material"], active_filament)
+            consumption[mat] = consumption.get(mat, 0) + r["quantity"]
 
-        cogs = (
-            filament_grams * (filament["cost_per_unit"] if filament else 0)
-            + BUNGEES_PER_ORDER * (bungee["cost_per_unit"] if bungee else 0)
-            + ENVELOPES_PER_ORDER * (envelope["cost_per_unit"] if envelope else 0)
-            + LABELS_PER_ORDER * (label["cost_per_unit"] if label else 0)
-        )
+        cogs = 0.0
+        for mat, qty in consumption.items():
+            conn.execute("UPDATE materials SET stock=MAX(0, stock-?) WHERE name=?", (qty, mat))
+            row = conn.execute("SELECT cost_per_unit FROM materials WHERE name=?", (mat,)).fetchone()
+            cogs += qty * ((row["cost_per_unit"] if row else 0) or 0)
         return cogs
+
+
+# --- Bill of materials (BOM) ---
+
+def get_bom() -> list[dict]:
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT scope, listing_id, material, quantity FROM bom "
+            "ORDER BY scope, listing_id, material"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_bom_entry(scope: str, listing_id: int, material: str, quantity: float):
+    with _db() as conn:
+        conn.execute("""
+            INSERT INTO bom (scope, listing_id, material, quantity)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(scope, listing_id, material) DO UPDATE SET quantity=excluded.quantity
+        """, (scope, listing_id, material, quantity))
+
+
+def remove_bom_entry(scope: str, listing_id: int, material: str) -> bool:
+    with _db() as conn:
+        cur = conn.execute(
+            "DELETE FROM bom WHERE scope=? AND listing_id=? AND material=?",
+            (scope, listing_id, material)
+        )
+        return cur.rowcount > 0
 
 
 def get_low_materials() -> list[dict]:

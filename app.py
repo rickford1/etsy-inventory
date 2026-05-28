@@ -3,12 +3,14 @@ Streamlit dashboard for the Etsy inventory + analytics system.
 Run with: streamlit run app.py
 """
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
 
 from inventory import (
     DB_PATH, init_db,
@@ -19,6 +21,7 @@ from inventory import (
 )
 
 
+load_dotenv()
 st.set_page_config(page_title="Etsy Shop Dashboard", layout="wide", page_icon=":bar_chart:")
 init_db()
 
@@ -78,7 +81,7 @@ def run_sync():
 # --- Sidebar nav ---
 
 with st.sidebar:
-    st.title("Rilos3dSolutions")
+    st.title(os.getenv("SHOP_NAME") or "Etsy Shop")
     st.caption(f"Last sync: {last_sync_display()}")
     if st.button("Sync now", use_container_width=True, type="primary"):
         run_sync()

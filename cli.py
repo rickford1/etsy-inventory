@@ -12,9 +12,14 @@ Commands:
   revenue                           Show revenue + profit summary (all time, 30d, 90d)
 
   materials                         Show all materials with stock + cost
+  add-material <name> <unit> [cost] [stock] [low]   Define a new material
   set-stock <material> <amount>     Set material stock to exact amount
   add-stock <material> <amount>     Add to material stock (e.g. restocking a roll)
   set-cost <material> <cost>        Set cost per unit for a material
+
+  bom                               Show the bill-of-materials that drives COGS
+  bom-set <target> <material> <qty> Set BOM qty; target = default | order | <listing_id>
+  bom-rm <target> <material>        Remove a BOM entry
 
   settings                          Show all settings
   set-setting <key> <value>         Update a setting (e.g. filament_cost_per_roll 14.00)
@@ -29,6 +34,7 @@ from etsy_client import EtsyClient
 from inventory import (
     get_all_listings, get_low_stock, init_db, upsert_listing,
     get_all_materials, get_material, set_material_stock, set_material_cost, add_material_stock,
+    add_material, get_bom, set_bom_entry, remove_bom_entry,
     get_all_settings, get_setting, set_setting,
     get_orders, get_revenue_summary, get_orders_with_fees,
     get_meta_spend_recent, get_roas_breakdown,
@@ -176,6 +182,60 @@ def cmd_set_cost(name: str, cost: float):
     print(f"Set {name} cost to ${cost:.4f}/unit")
 
 
+def cmd_add_material(name: str, unit: str, cost: float = 0.0, stock: float = 0.0, low: float = 0.0):
+    init_db()
+    add_material(name, unit, float(cost), float(stock), float(low))
+    print(f"Added material {name} ({unit}) — cost ${float(cost):.4f}/unit, "
+          f"stock {float(stock):g}, low at {float(low):g}")
+
+
+def _parse_bom_target(target: str):
+    """Map a CLI target to (scope, listing_id)."""
+    t = target.lower()
+    if t == "order":
+        return "order", 0
+    if t == "default":
+        return "item", 0
+    return "item", int(target)
+
+
+def cmd_bom():
+    init_db()
+    rows = get_bom()
+    if not rows:
+        print("No BOM configured — COGS will be 0 until you add entries.")
+        print("  python cli.py bom-set default <material> <qty_per_item>")
+        print("  python cli.py bom-set order   <material> <qty_per_order>")
+        return
+    item_rows = [r for r in rows if r["scope"] == "item"]
+    order_rows = [r for r in rows if r["scope"] == "order"]
+    if item_rows:
+        print("Per-item materials:")
+        for r in item_rows:
+            who = "default (all listings)" if r["listing_id"] == 0 else f"listing {r['listing_id']}"
+            print(f"  {who:<26} {r['material']:<18} {r['quantity']:g} / item")
+    if order_rows:
+        print("Per-order materials:")
+        for r in order_rows:
+            print(f"  {'every order':<26} {r['material']:<18} {r['quantity']:g} / order")
+
+
+def cmd_bom_set(target: str, material: str, qty: float):
+    init_db()
+    scope, listing_id = _parse_bom_target(target)
+    set_bom_entry(scope, listing_id, material, float(qty))
+    print(f"Set {scope} BOM [{target}] {material} = {float(qty):g}")
+
+
+def cmd_bom_rm(target: str, material: str):
+    init_db()
+    scope, listing_id = _parse_bom_target(target)
+    if remove_bom_entry(scope, listing_id, material):
+        print(f"Removed {scope} BOM [{target}] {material}")
+    else:
+        print("No matching BOM entry")
+
+
 def cmd_settings():
     init_db()
     settings = get_all_settings()
@@ -284,6 +344,23 @@ def main():
             print("Usage: python cli.py set-cost <material> <cost>")
             sys.exit(1)
         cmd_set_cost(args[1], float(args[2]))
+    elif cmd == "add-material":
+        if len(args) < 3:
+            print("Usage: python cli.py add-material <name> <unit> [cost] [stock] [low]")
+            sys.exit(1)
+        cmd_add_material(*args[1:6])
+    elif cmd == "bom":
+        cmd_bom()
+    elif cmd == "bom-set":
+        if len(args) < 4:
+            print("Usage: python cli.py bom-set <target> <material> <qty>   (target = default | order | <listing_id>)")
+            sys.exit(1)
+        cmd_bom_set(args[1], args[2], args[3])
+    elif cmd == "bom-rm":
+        if len(args) < 3:
+            print("Usage: python cli.py bom-rm <target> <material>")
+            sys.exit(1)
+        cmd_bom_rm(args[1], args[2])
     elif cmd == "settings":
         cmd_settings()
     elif cmd == "set-setting":

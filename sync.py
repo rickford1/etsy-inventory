@@ -90,8 +90,11 @@ def sync_orders(client: EtsyClient):
             )
 
         if is_new:
-            item_count = sum(t.get("quantity", 1) for t in transactions)
-            cogs = deduct_materials_for_order(item_count)
+            items = [
+                {"listing_id": t.get("listing_id", 0), "quantity": t.get("quantity", 1)}
+                for t in transactions
+            ]
+            cogs = deduct_materials_for_order(items)
             set_order_cogs(receipt_id, cogs)
             mark_order_processed(receipt_id)
             new_count += 1
@@ -156,16 +159,27 @@ def sync_payments(client: EtsyClient):
 
 
 def sync_meta_spend(days_back: int = 90):
-    """Pull daily per-campaign insights from Meta and upsert into meta_spend."""
+    """Pull daily per-campaign insights from Meta and upsert into meta_spend.
+    Failures (expired token, missing env vars, etc.) are logged but don't break the sync."""
     print(f"Syncing Meta ad spend (last {days_back} days)...")
     try:
         from meta_client import MetaClient
-    except ImportError:
-        print("  meta_client not available, skipping")
+    except (ImportError, KeyError) as e:
+        print(f"  skipped: {e}")
         return
 
-    client = MetaClient()
-    rows = client.get_daily_insights(days_back=days_back, level="campaign")
+    try:
+        client = MetaClient()
+        rows = client.get_daily_insights(days_back=days_back, level="campaign")
+    except Exception as e:
+        msg = str(e)
+        if "Session has expired" in msg or "OAuthException" in msg:
+            print("  Meta access token has expired — regenerate at developers.facebook.com/tools/explorer")
+            print("  and update META_ACCESS_TOKEN in .env")
+        else:
+            print(f"  failed: {msg[:200]}")
+        return
+
     if not rows:
         print("  no spend rows returned (campaign may not have run)")
         return
