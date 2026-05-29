@@ -3,4 +3,4 @@ venv/
 *.pyc
 __pycache__/
 tokens.json
-inventory.db
+inventory.db*
