@@ -22,10 +22,25 @@ DEFAULT_LISTING = 0                       # per-item BOM applied to any listing 
 ACTIVE_FILAMENT_REF = "@active_filament"  # resolves to the active_filament setting at deduct time
 
 
+def connect(timeout: float = 30.0):
+    """Open a SQLite connection configured for concurrent CLI + Streamlit access.
+
+    WAL mode lets readers run while a single writer is active, and busy_timeout
+    makes a blocked writer wait for the lock instead of failing immediately with
+    'database is locked'. Both are needed because the sync CLI and the dashboard
+    can hit the same db file at the same time.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=timeout)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
 @contextmanager
 def _db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = connect()
     try:
         yield conn
         conn.commit()

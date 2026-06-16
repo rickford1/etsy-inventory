@@ -3,12 +3,11 @@ Sync Etsy listings and orders into the local database.
 New orders trigger automatic material deductions.
 """
 
-import sqlite3
 from datetime import datetime, timezone
 
 from etsy_client import EtsyClient
 from inventory import (
-    DB_PATH,
+    DB_PATH, connect,
     init_db, upsert_listing, upsert_order, upsert_order_item, clear_order_items,
     set_order_cogs, mark_order_processed,
     deduct_materials_for_order, get_low_materials, get_low_stock,
@@ -131,7 +130,7 @@ def sync_ledger(client: EtsyClient):
 def sync_payments(client: EtsyClient):
     """Fetch processing fees from /receipts/{id}/payments for each receipt."""
     print("Syncing per-receipt payment fees...")
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect()
     receipts = [r[0] for r in conn.execute(
         "SELECT receipt_id FROM orders WHERE status != 'cancelled'"
     ).fetchall()]
@@ -150,7 +149,7 @@ def sync_payments(client: EtsyClient):
         if not fees_obj:
             continue
         fee = float(fees_obj.get("amount", 0)) / max(fees_obj.get("divisor", 1), 1)
-        conn2 = sqlite3.connect(DB_PATH)
+        conn2 = connect()
         conn2.execute("UPDATE orders SET processing_fee=? WHERE receipt_id=?", (fee, receipt_id))
         conn2.commit()
         conn2.close()
